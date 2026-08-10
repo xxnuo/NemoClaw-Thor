@@ -447,3 +447,49 @@ free -h
 ```
 
 不要在容器运行时 drop caches，也不要用 `docker system prune` 代替精确停止。
+
+## 分析
+
+有性能问题，但目前没有发现正确性问题。TP 请求均成功、输出 hash 一致、NCCL rank 没有掉线；慢主要来自当前实现和硬件组合不匹配。
+
+主要原因：
+
+1. **实际上只用了 1 条 25G 链路**
+
+日志确认 NCCL 只在 `mgbe0_0 / NET/Socket/0` 建立数据连接，另外两条链路没有流量。强制 6 channels 也没启用多链路，反而让 decode 从约 `1.95` 降到 `1.19 tok/s`。
+
+2. **TP 的通信频率远高于流水线并行**
+
+TP 在每层的 attention、FFN、expert、output 等切分点都需要 NCCL collective。Decode 每生成一个 token 都要反复跨机同步几十次，小消息的 TCP 延迟比 25G 峰值带宽更关键。
+
+流水线模式只在 `gpu2 0:28 -> gpu3 29:output` 的边界传一次 activation，因此更适合两机 Socket 网络。
+
+3. **两台 Thor 性能不对称，但 PR 固定 50/50 切分**
+
+```text
+gpu2: 20 SM，experts 0..127
+gpu3: 12 SM，experts 128..255
+```
+
+gpu3 只有 gpu2 的约 60% 算力，却承担一半 expert 和完整层同步。每次 collective 都必须等待 gpu3，整体速度由 gpu3 决定。
+
+流水线的 `29 层 / 14 层` 分配反而更接近两机实际性能。
+
+4. **gpu3 内存过紧**
+
+TP 每个 rank 都要执行全部层、保存完整 KV cache，并映射约 `44.48 GiB` 权重。gpu3 使用 `DS4_CUDA_DIRECT_MODEL=1`、`ctx=32768` 后仍接近 64 GiB 上限，日志出现过 `NV_ERR_NO_MEMORY` 重试。这不会解释全部差距，但会进一步拖慢首轮和缓存访问。
+
+5. **这是实验性网络 TP**
+
+PR #754 原本主要验证对称的 128 GiB rank。当前 `128+64 GiB + NCCL Socket + 单条25G有效链路` 属于额外的异构紧内存场景，TP 的价值主要是让模型分片运行，不是提升速度。
+
+实测差距符合以上瓶颈：
+
+```text
+Decode:
+TP        3.47-4.14 tok/s
+Pipeline  9.25-10.65 tok/s
+差距      2.6-2.9 倍
+```
+
+因此当前生产配置应继续使用流水线并行。要让 TP 有竞争力，至少需要解决实际多链路 NCCL、按算力加权分片，以及小粒度 collective 延迟；仅增加 NCCL channels 不够。对比数据在 [DS4-DUAL-MACHINE-TENSOR-PARALLEL-RUNBOOK.md](/home/xxnuo/projects/work/NemoClaw-Thor/serving/docs/DS4-DUAL-MACHINE-TENSOR-PARALLEL-RUNBOOK.md:345)。
