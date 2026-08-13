@@ -1,0 +1,46 @@
+diff --git a/ds4.c b/ds4.c
+index 0fb6062..31cd470 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -66250,6 +66250,7 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
+         return 1;
+     }
+     ds4_engine *e = first->engine;
++    const bool mirror = e->tp.active && e->tp.rank == 0;
+     for (int i = 0; i < count; i++) {
+         ds4_session *s = items[i].session;
+         if (!s || s->engine != e) {
+@@ -66286,6 +66287,20 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
+     if (e->backend == DS4_BACKEND_CUDA &&
+         !ds4_session_is_glm(first) &&
+         e->support_kind == DS4_SUPPORT_NONE) {
++        if (mirror) {
++            ds4_tp_batch_item *wire = ds4_sessions_tp_batch_items(items, count);
++            const bool sent = wire &&
++                ds4_tp_send_eval_batch(e->tp.ctx, wire, (uint32_t)count);
++            free(wire);
++            if (!sent) {
++                if (err && errlen) snprintf(err, errlen,
++                                            "tp: worker decode batch send failed");
++                for (int i = 0; i < count; i++) {
++                    ds4_session_invalidate(items[i].session);
++                }
++                return 1;
++            }
++        }
+         bool ok = ds4_gpu_begin_commands() != 0;
+         for (int i = 0; ok && i < count; i++) {
+             ds4_session *s = items[i].session;
+@@ -66324,6 +66339,12 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
+                     s->logits,
+                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+         }
++        if (ok && mirror) {
++            ok = ds4_tp_wait_command_ack(e->tp.ctx, 0, "decode batch",
++                                         err, errlen) &&
++                 ds4_sessions_tp_recv_logits(e, NULL, items, count,
++                                              err, errlen);
++        }
+         if (!ok) {
+             for (int i = 0; i < count; i++) {
+                 items[i].session->checkpoint_valid = false;
